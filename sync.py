@@ -4,15 +4,19 @@ GitHub → Sentry Team Sync
 
 Syncs GitHub org teams and their members to Sentry.
 Users are matched across platforms by email address.
+Team renames are detected via a state.json file that maps
+persistent GitHub team IDs to their last-known Sentry slug.
 
 Usage:
     python sync.py                        # apply changes
     python sync.py --dry-run              # preview changes without applying
     python sync.py --invite-missing       # invite GitHub members not yet in Sentry
+    python sync.py --delete-removed       # delete Sentry teams no longer in GitHub
     python sync.py --verbose              # show debug output
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -21,7 +25,27 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 
+STATE_FILE = "state.json"
+
 log = logging.getLogger("sync")
+
+
+# ---------------------------------------------------------------------------
+# State management
+# ---------------------------------------------------------------------------
+
+def load_state() -> dict:
+    """Load persisted mapping of GitHub team ID → Sentry team slug."""
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {"teams": {}}
+
+
+def save_state(state: dict) -> None:
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+    log.debug(f"State saved to {STATE_FILE}")
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +71,7 @@ class GitHubClient:
             resp.raise_for_status()
             results.extend(resp.json())
             url = resp.links.get("next", {}).get("url")
-            params = {}  # params are already encoded in the next URL
+            params = {}  # already encoded in the next URL
         return results
 
     def get_teams(self, org: str) -> list[dict]:
@@ -106,6 +130,20 @@ class SentryClient:
         resp.raise_for_status()
         return resp.json()
 
+    def update_team(self, old_slug: str, new_name: str, new_slug: str) -> dict:
+        resp = self.session.put(
+            f"{self.BASE}/teams/{self.org}/{old_slug}/",
+            json={"name": new_name, "slug": new_slug},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def delete_team(self, team_slug: str) -> None:
+        resp = self.session.delete(
+            f"{self.BASE}/teams/{self.org}/{team_slug}/"
+        )
+        resp.raise_for_status()
+
     def get_org_members(self) -> list[dict]:
         return self._paginate(f"{self.BASE}/organizations/{self.org}/members/")
 
@@ -131,18 +169,34 @@ class SentryClient:
 # Sync logic
 # ---------------------------------------------------------------------------
 
-def sync(github_token: str, github_org: str, sentry_token: str, sentry_org: str, dry_run: bool = False, invite_missing: bool = False) -> None:
+def sync(
+    github_token: str,
+    github_org: str,
+    sentry_token: str,
+    sentry_org: str,
+    dry_run: bool = False,
+    invite_missing: bool = False,
+    delete_removed: bool = False,
+) -> None:
     if dry_run:
         log.info("DRY RUN — no changes will be applied")
     if invite_missing:
         log.info("INVITE MODE — members not in Sentry will be sent an invitation")
+    if delete_removed:
+        log.info("DELETE MODE — Sentry teams not in GitHub will be deleted")
 
     gh = GitHubClient(github_token)
     sentry = SentryClient(sentry_token, sentry_org)
 
+    # --- Load persisted state ---
+    state = load_state()
+    state_teams: dict[str, str] = state.get("teams", {})  # github_id (str) → sentry_slug
+    log.debug(f"Loaded state: {len(state_teams)} tracked teams")
+
     # --- Fetch everything upfront ---
     log.info("Fetching GitHub teams...")
     gh_teams = gh.get_teams(github_org)
+    gh_team_by_id = {str(t["id"]): t for t in gh_teams}
     log.info(f"  {len(gh_teams)} teams found")
 
     log.info("Fetching Sentry teams...")
@@ -157,7 +211,9 @@ def sync(github_token: str, github_org: str, sentry_token: str, sentry_org: str,
 
     stats = {
         "teams_created": 0,
+        "teams_renamed": 0,
         "teams_already_exist": 0,
+        "teams_deleted": 0,
         "members_added": 0,
         "members_already_in_team": 0,
         "members_invited": 0,
@@ -166,23 +222,57 @@ def sync(github_token: str, github_org: str, sentry_token: str, sentry_org: str,
         "errors": 0,
     }
 
-    # Track invited emails within this run so we don't send duplicate invites
-    # if the same person appears in multiple GitHub teams
-    invited_this_run: dict[str, dict] = {}  # email -> sentry member object returned by invite
+    # Track emails invited this run to avoid duplicate invitations across teams
+    invited_this_run: dict[str, dict] = {}  # email → sentry member object
 
     # --- Process each GitHub team ---
     for gh_team in gh_teams:
-        team_slug = gh_team["slug"]
-        team_name = gh_team["name"]
+        gh_id = str(gh_team["id"])
+        current_slug = gh_team["slug"]
+        current_name = gh_team["name"]
 
-        log.info(f"\nTeam: {team_name} ({team_slug})")
+        log.info(f"\nTeam: {current_name} ({current_slug})")
 
-        # Create team in Sentry if missing
-        if team_slug not in sentry_team_by_slug:
+        # Determine the active Sentry slug for this team, handling renames
+        old_sentry_slug = state_teams.get(gh_id)
+        active_slug = current_slug  # the slug we'll use for member operations
+
+        if old_sentry_slug and old_sentry_slug != current_slug:
+            # Team was renamed in GitHub
+            if old_sentry_slug in sentry_team_by_slug:
+                log.info(f"  [RENAME] {old_sentry_slug} → {current_slug}")
+                if not dry_run:
+                    try:
+                        sentry.update_team(old_sentry_slug, current_name, current_slug)
+                        # Update local lookup so member sync uses the new slug
+                        sentry_team_by_slug[current_slug] = sentry_team_by_slug.pop(old_sentry_slug)
+                        stats["teams_renamed"] += 1
+                    except requests.HTTPError as e:
+                        log.error(f"  [ERROR] Failed to rename team: {e.response.text}")
+                        stats["errors"] += 1
+                        active_slug = old_sentry_slug  # fall back to old slug for member sync
+                else:
+                    stats["teams_renamed"] += 1
+            else:
+                # Old slug is gone from Sentry (deleted manually) — create fresh
+                log.info(f"  [CREATE] Old slug '{old_sentry_slug}' not found in Sentry — creating as {current_slug}")
+                if not dry_run:
+                    try:
+                        sentry.create_team(current_name, current_slug)
+                        stats["teams_created"] += 1
+                    except requests.HTTPError as e:
+                        log.error(f"  [ERROR] Failed to create team: {e.response.text}")
+                        stats["errors"] += 1
+                        continue
+                else:
+                    stats["teams_created"] += 1
+
+        elif current_slug not in sentry_team_by_slug:
+            # Brand new team
             log.info(f"  [CREATE] Team does not exist in Sentry — creating")
             if not dry_run:
                 try:
-                    sentry.create_team(team_name, team_slug)
+                    sentry.create_team(current_name, current_slug)
                     stats["teams_created"] += 1
                 except requests.HTTPError as e:
                     log.error(f"  [ERROR] Failed to create team: {e.response.text}")
@@ -190,24 +280,28 @@ def sync(github_token: str, github_org: str, sentry_token: str, sentry_org: str,
                     continue
             else:
                 stats["teams_created"] += 1
+
         else:
             log.debug(f"  Team already exists in Sentry")
             stats["teams_already_exist"] += 1
 
+        # Update state (in memory; written to disk after the loop)
+        state_teams[gh_id] = current_slug
+
         # Fetch GitHub team members
-        gh_members = gh.get_team_members(github_org, team_slug)
+        gh_members = gh.get_team_members(github_org, current_slug)
         log.debug(f"  {len(gh_members)} members in GitHub team")
 
         # Fetch current Sentry team members
         try:
             sentry_team_member_ids = {
-                m["id"] for m in sentry.get_team_members(team_slug)
+                m["id"] for m in sentry.get_team_members(active_slug)
             }
         except requests.HTTPError as e:
             log.error(f"  [ERROR] Could not fetch Sentry team members: {e.response.text}")
             sentry_team_member_ids = set()
 
-        # Add missing members
+        # Sync members
         for gh_member in gh_members:
             username = gh_member["login"]
 
@@ -230,22 +324,22 @@ def sync(github_token: str, github_org: str, sentry_token: str, sentry_org: str,
                     stats["members_skipped_not_in_sentry"] += 1
                     continue
 
-                # Already invited this person in an earlier team — just add to this team
+                # Already invited this person earlier in this run — add to this team too
                 if email.lower() in invited_this_run:
                     sentry_member = invited_this_run[email.lower()]
-                    log.info(f"  [ADD] {username} ({email}) → {team_slug} (pending invite)")
+                    log.info(f"  [ADD] {username} ({email}) → {active_slug} (pending invite)")
                     if not dry_run:
                         try:
-                            sentry.add_member_to_team(sentry_member["id"], team_slug)
+                            sentry.add_member_to_team(sentry_member["id"], active_slug)
                         except requests.HTTPError as e:
-                            log.error(f"  [ERROR] Failed to add {username} to {team_slug}: {e.response.text}")
+                            log.error(f"  [ERROR] Failed to add {username} to {active_slug}: {e.response.text}")
                             stats["errors"] += 1
                     continue
 
-                log.info(f"  [INVITE] {username} ({email}) → invite sent, added to {team_slug}")
+                log.info(f"  [INVITE] {username} ({email}) → invite sent, added to {active_slug}")
                 if not dry_run:
                     try:
-                        invited_member = sentry.invite_member(email, team_slug)
+                        invited_member = sentry.invite_member(email, active_slug)
                         invited_this_run[email.lower()] = invited_member
                         sentry_member_by_email[email.lower()] = invited_member
                         stats["members_invited"] += 1
@@ -261,10 +355,10 @@ def sync(github_token: str, github_org: str, sentry_token: str, sentry_org: str,
                 stats["members_already_in_team"] += 1
                 continue
 
-            log.info(f"  [ADD] {username} ({email}) → {team_slug}")
+            log.info(f"  [ADD] {username} ({email}) → {active_slug}")
             if not dry_run:
                 try:
-                    sentry.add_member_to_team(sentry_member["id"], team_slug)
+                    sentry.add_member_to_team(sentry_member["id"], active_slug)
                     stats["members_added"] += 1
                 except requests.HTTPError as e:
                     log.error(f"  [ERROR] Failed to add {username}: {e.response.text}")
@@ -272,11 +366,45 @@ def sync(github_token: str, github_org: str, sentry_token: str, sentry_org: str,
             else:
                 stats["members_added"] += 1
 
+    # --- Delete Sentry teams whose GitHub team no longer exists ---
+    if delete_removed:
+        removed_gh_ids = set(state_teams.keys()) - set(gh_team_by_id.keys())
+        removed_teams = [(gh_id, state_teams[gh_id]) for gh_id in removed_gh_ids]
+
+        if removed_teams:
+            log.info(f"\nTeams removed from GitHub ({len(removed_teams)}):")
+            for gh_id, sentry_slug in removed_teams:
+                if sentry_slug in sentry_team_by_slug:
+                    log.info(f"  [DELETE] {sentry_slug}")
+                    if not dry_run:
+                        try:
+                            sentry.delete_team(sentry_slug)
+                            stats["teams_deleted"] += 1
+                        except requests.HTTPError as e:
+                            log.error(f"  [ERROR] Failed to delete {sentry_slug}: {e.response.text}")
+                            stats["errors"] += 1
+                            continue
+                    else:
+                        stats["teams_deleted"] += 1
+                else:
+                    log.debug(f"  {sentry_slug} already gone from Sentry, skipping")
+
+                if not dry_run:
+                    del state_teams[gh_id]
+        else:
+            log.info("\nNo teams removed from GitHub")
+
+    # --- Persist state ---
+    if not dry_run:
+        save_state({"teams": state_teams})
+
     # --- Summary ---
     log.info("\n" + "=" * 50)
     log.info("Sync complete")
     log.info(f"  Teams created:              {stats['teams_created']}")
+    log.info(f"  Teams renamed:              {stats['teams_renamed']}")
     log.info(f"  Teams already in Sentry:    {stats['teams_already_exist']}")
+    log.info(f"  Teams deleted:              {stats['teams_deleted']}")
     log.info(f"  Members added:              {stats['members_added']}")
     log.info(f"  Members already in team:    {stats['members_already_in_team']}")
     log.info(f"  Members invited to Sentry:  {stats['members_invited']}")
@@ -308,6 +436,11 @@ def main():
         "--invite-missing",
         action="store_true",
         help="Invite GitHub members who are not yet in the Sentry org",
+    )
+    parser.add_argument(
+        "--delete-removed",
+        action="store_true",
+        help="Delete Sentry teams that no longer exist in GitHub",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -342,7 +475,15 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    sync(github_token, github_org, sentry_token, sentry_org, dry_run=args.dry_run, invite_missing=args.invite_missing)
+    sync(
+        github_token,
+        github_org,
+        sentry_token,
+        sentry_org,
+        dry_run=args.dry_run,
+        invite_missing=args.invite_missing,
+        delete_removed=args.delete_removed,
+    )
 
 
 if __name__ == "__main__":
