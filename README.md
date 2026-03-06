@@ -49,11 +49,14 @@ python sync.py
 # Also invite GitHub members who are not yet in the Sentry org
 python sync.py --invite-missing
 
+# Also remove members from Sentry teams if they left the GitHub team
+python sync.py --remove-departed
+
 # Also delete Sentry teams that no longer exist in GitHub
 python sync.py --delete-removed
 
-# Combine flags
-python sync.py --invite-missing --delete-removed
+# Full sync — all options enabled
+python sync.py --invite-missing --remove-departed --delete-removed
 
 # Verbose output for debugging
 python sync.py --dry-run --verbose
