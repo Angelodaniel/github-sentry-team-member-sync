@@ -9,6 +9,21 @@ Keeps Sentry teams in sync with your GitHub org teams.
 - Users are matched across platforms by **email address**
 - Safe by default: only adds and creates, never deletes unless `--delete-removed` is passed
 
+## Coverage
+
+| Scenario | Covered | Notes |
+|---|---|---|
+| Team created in GitHub | ✅ | Created automatically in Sentry |
+| Team deleted in GitHub | ✅ | Use `--delete-removed` |
+| Team renamed in GitHub | ✅ | Renamed in place via `state.json`, preserves issue ownership |
+| Member added to a team | ✅ | Added to the Sentry team |
+| Member removed from a team | ✅ | Use `--remove-departed` |
+| Member moved to another team | ✅ | Removed from old team, added to new team |
+| Consistent email via Okta/SSO | ✅ | Email matching works reliably |
+| SCIM enabled | ✅ | Users already provisioned, script manages team membership only |
+| SCIM disabled | ✅ | Use `--invite-missing` to invite users not yet in Sentry |
+| Private GitHub email | ⚠️ | User is skipped with a warning — see note below |
+
 ## Setup
 
 ```bash
@@ -61,8 +76,6 @@ python sync.py --invite-missing --remove-departed --delete-removed
 # Verbose output for debugging
 python sync.py --dry-run --verbose
 ```
-
-> **Note on team renames:** if a team is renamed in GitHub its slug changes, so the script will create a new Sentry team with the new slug. Run with `--delete-removed` to also clean up the old one.
 
 ## How team renames are handled
 
