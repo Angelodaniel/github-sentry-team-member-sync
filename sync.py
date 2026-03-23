@@ -7,6 +7,15 @@ Users are matched across platforms by email address.
 Team renames are detected via a state.json file that maps
 persistent GitHub team IDs to their last-known Sentry slug.
 
+Email resolution order (first match wins):
+  1. USERNAME_MAP_FILE  — explicit JSON override {"github-login": "user@company.com"}
+  2. GitHub GraphQL organizationVerifiedDomainEmails — returns the verified
+     org-domain email even when the public profile email is empty (requires read:org scope)
+  3. Public GitHub profile email — least reliable, used as last resort
+
+If CODEOWNERS_REPOS is set, only teams referenced in those repos'
+CODEOWNERS files are synced (rather than all org teams).
+
 Usage:
     python sync.py                        # apply changes
     python sync.py --dry-run              # preview changes without applying
@@ -20,6 +29,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from typing import Optional
 
@@ -81,10 +91,66 @@ class GitHubClient:
     def get_team_members(self, org: str, team_slug: str) -> list[dict]:
         return self._paginate(f"{self.BASE}/orgs/{org}/teams/{team_slug}/members")
 
-    def get_user_email(self, username: str) -> Optional[str]:
+    def get_user_org_email(self, username: str, org: str) -> Optional[str]:
+        """
+        Use the GitHub GraphQL API to fetch the verified org-domain email for a user.
+        Returns the first verified email address (e.g. user@company.com) or None.
+        Works even when the user's public GitHub profile email is empty.
+        Requires the token to have read:org scope.
+        """
+        query = """
+        query($user: String!, $org: String!) {
+          user(login: $user) {
+            organizationVerifiedDomainEmails(login: $org)
+          }
+        }
+        """
+        resp = self.session.post(
+            f"{self.BASE}/graphql",
+            json={"query": query, "variables": {"user": username, "org": org}},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        emails = (
+            data.get("data", {})
+            .get("user", {})
+            .get("organizationVerifiedDomainEmails", [])
+        )
+        return emails[0] if emails else None
+
+    def get_user_public_email(self, username: str) -> Optional[str]:
+        """Fetch the public profile email for a user (fallback, often empty)."""
         resp = self.session.get(f"{self.BASE}/users/{username}")
         resp.raise_for_status()
         return resp.json().get("email") or None
+
+    def get_codeowners_teams(self, org: str, repo: str) -> set[str]:
+        """
+        Fetch the CODEOWNERS file from a repo and return the set of team slugs
+        referenced as @org/team-name. Tries CODEOWNERS, .github/CODEOWNERS,
+        and docs/CODEOWNERS in order.
+        """
+        candidate_paths = ["CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"]
+        content = None
+        for path in candidate_paths:
+            resp = self.session.get(
+                f"{self.BASE}/repos/{org}/{repo}/contents/{path}",
+                headers={"Accept": "application/vnd.github.raw+json"},
+            )
+            if resp.status_code == 200:
+                content = resp.text
+                log.debug(f"  Found CODEOWNERS at {repo}/{path}")
+                break
+        if content is None:
+            log.warning(f"  No CODEOWNERS found in {repo}")
+            return set()
+
+        # Match @org/team-name patterns
+        teams = set()
+        for match in re.finditer(rf"@{re.escape(org)}/([a-zA-Z0-9_-]+)", content):
+            teams.add(match.group(1))
+        log.debug(f"  {repo}: found {len(teams)} teams in CODEOWNERS")
+        return teams
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +235,12 @@ class SentryClient:
         resp.raise_for_status()
         return resp.json()
 
+    def link_team_to_project(self, team_slug: str, project_slug: str) -> None:
+        resp = self.session.post(
+            f"{self.BASE}/projects/{self.org}/{project_slug}/teams/{team_slug}/"
+        )
+        resp.raise_for_status()
+
 
 # ---------------------------------------------------------------------------
 # Sync logic
@@ -183,6 +255,9 @@ def sync(
     invite_missing: bool = False,
     remove_departed: bool = False,
     delete_removed: bool = False,
+    codeowners_repos: list[str] = None,
+    username_map: dict[str, str] = None,
+    project_map: dict[str, list[str]] = None,
 ) -> None:
     if dry_run:
         log.info("DRY RUN — no changes will be applied")
@@ -207,6 +282,20 @@ def sync(
     gh_team_by_id = {str(t["id"]): t for t in gh_teams}
     log.info(f"  {len(gh_teams)} teams found")
 
+    # --- Filter to CODEOWNERS teams if repos are specified ---
+    team_source_repos: dict[str, set[str]] = {}  # team_slug → set of repos that reference it
+    if codeowners_repos:
+        log.info(f"Scanning CODEOWNERS from: {', '.join(codeowners_repos)}")
+        allowed_slugs: set[str] = set()
+        for repo in codeowners_repos:
+            repo_teams = gh.get_codeowners_teams(github_org, repo)
+            for slug in repo_teams:
+                allowed_slugs.add(slug)
+                team_source_repos.setdefault(slug, set()).add(repo)
+        log.info(f"  {len(allowed_slugs)} unique teams referenced in CODEOWNERS")
+        gh_teams = [t for t in gh_teams if t["slug"] in allowed_slugs]
+        log.info(f"  Filtered to {len(gh_teams)} teams")
+
     log.info("Fetching Sentry teams...")
     sentry_teams = sentry.get_teams()
     sentry_team_by_slug = {t["slug"]: t for t in sentry_teams}
@@ -222,6 +311,7 @@ def sync(
         "teams_renamed": 0,
         "teams_already_exist": 0,
         "teams_deleted": 0,
+        "teams_linked_to_projects": 0,
         "members_added": 0,
         "members_removed": 0,
         "members_already_in_team": 0,
@@ -294,6 +384,26 @@ def sync(
         # Update state (written to disk after the full loop)
         state_teams[gh_id] = current_slug
 
+        # --- Link team to Sentry projects if a project_map is configured ---
+        if project_map and team_source_repos:
+            projects_to_link: set[str] = set()
+            for repo in team_source_repos.get(current_slug, set()):
+                projects_to_link.update(project_map.get(repo, []))
+            for project_slug in projects_to_link:
+                log.info(f"  [LINK] {current_slug} → project:{project_slug}")
+                if not dry_run:
+                    try:
+                        sentry.link_team_to_project(current_slug, project_slug)
+                        stats["teams_linked_to_projects"] += 1
+                    except requests.HTTPError as e:
+                        if e.response.status_code == 409:
+                            log.debug(f"  {current_slug} already linked to {project_slug}")
+                        else:
+                            log.error(f"  [ERROR] Failed to link {current_slug} to {project_slug}: {e.response.text}")
+                            stats["errors"] += 1
+                else:
+                    stats["teams_linked_to_projects"] += 1
+
         # --- Resolve GitHub team members and their emails ---
         gh_members_raw = gh.get_team_members(github_org, current_slug)
         log.debug(f"  {len(gh_members_raw)} members in GitHub team")
@@ -303,16 +413,37 @@ def sync(
 
         for gh_member in gh_members_raw:
             username = gh_member["login"]
-            try:
-                email = gh.get_user_email(username)
-            except requests.HTTPError as e:
-                log.warning(f"  [SKIP] {username}: could not fetch GitHub user — {e}")
-                stats["errors"] += 1
-                continue
+            email = None
+
+            # 1. Try username map first (explicit override — useful for edge cases)
+            if username_map:
+                email = username_map.get(username) or username_map.get(username.lower())
+
+            # 2. GitHub GraphQL organizationVerifiedDomainEmails — returns the verified
+            #    work email (e.g. user@company.com) even when the public profile is empty.
+            #    This is the primary lookup for orgs with personal GitHub accounts.
             if not email:
-                log.warning(f"  [SKIP] {username}: no public email on GitHub")
+                try:
+                    email = gh.get_user_org_email(username, github_org)
+                except requests.HTTPError as e:
+                    log.warning(f"  [SKIP] {username}: GraphQL org email lookup failed — {e}")
+                    stats["errors"] += 1
+                    continue
+
+            # 3. Fall back to public GitHub profile email (least reliable)
+            if not email:
+                try:
+                    email = gh.get_user_public_email(username)
+                except requests.HTTPError as e:
+                    log.warning(f"  [SKIP] {username}: could not fetch GitHub user — {e}")
+                    stats["errors"] += 1
+                    continue
+
+            if not email:
+                log.warning(f"  [SKIP] {username}: no email found via org domain, public profile, or username map")
                 stats["members_skipped_no_email"] += 1
                 continue
+
             gh_member_emails.add(email.lower())
             gh_members_resolved.append((username, email))
 
@@ -433,11 +564,12 @@ def sync(
     log.info(f"  Teams renamed:              {stats['teams_renamed']}")
     log.info(f"  Teams already in Sentry:    {stats['teams_already_exist']}")
     log.info(f"  Teams deleted:              {stats['teams_deleted']}")
+    log.info(f"  Teams linked to projects:   {stats['teams_linked_to_projects']}")
     log.info(f"  Members added:              {stats['members_added']}")
     log.info(f"  Members removed:            {stats['members_removed']}")
     log.info(f"  Members already in team:    {stats['members_already_in_team']}")
     log.info(f"  Members invited to Sentry:  {stats['members_invited']}")
-    log.info(f"  Skipped (no GitHub email):  {stats['members_skipped_no_email']}")
+    log.info(f"  Skipped (no email found):   {stats['members_skipped_no_email']}")
     log.info(f"  Skipped (not in Sentry):    {stats['members_skipped_not_in_sentry']}")
     log.info(f"  Errors:                     {stats['errors']}")
     if dry_run:
@@ -509,6 +641,34 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    # --- CODEOWNERS repos ---
+    codeowners_repos = None
+    raw_repos = os.getenv("CODEOWNERS_REPOS", "").strip()
+    if raw_repos:
+        codeowners_repos = [r.strip() for r in raw_repos.split(",") if r.strip()]
+
+    # --- Username → email map ---
+    username_map = None
+    map_file = os.getenv("USERNAME_MAP_FILE", "").strip()
+    if map_file:
+        if not os.path.exists(map_file):
+            print(f"Error: USERNAME_MAP_FILE '{map_file}' not found", file=sys.stderr)
+            sys.exit(1)
+        with open(map_file) as f:
+            username_map = json.load(f)
+        log.info(f"Loaded username map: {len(username_map)} entries from {map_file}")
+
+    # --- Project map ---
+    project_map = None
+    project_map_file = os.getenv("PROJECT_MAP_FILE", "").strip()
+    if project_map_file:
+        if not os.path.exists(project_map_file):
+            print(f"Error: PROJECT_MAP_FILE '{project_map_file}' not found", file=sys.stderr)
+            sys.exit(1)
+        with open(project_map_file) as f:
+            project_map = json.load(f)
+        log.info(f"Loaded project map: {len(project_map)} repo entries from {project_map_file}")
+
     sync(
         github_token,
         github_org,
@@ -518,6 +678,9 @@ def main():
         invite_missing=args.invite_missing,
         remove_departed=args.remove_departed,
         delete_removed=args.delete_removed,
+        codeowners_repos=codeowners_repos,
+        username_map=username_map,
+        project_map=project_map,
     )
 
 
